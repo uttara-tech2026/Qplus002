@@ -173,7 +173,7 @@ async def init_db():
         await conn.execute("ALTER TABLE user_logs ADD COLUMN IF NOT EXISTS queue_id INT;")
 
 
-# ==================== FSM STATES (DEFINED EARLY TO PREVENT NAMEERROR) ====================
+# ==================== FSM STATES ====================
 
 class AdminStates(StatesGroup):
     waiting_for_queue_name = State()
