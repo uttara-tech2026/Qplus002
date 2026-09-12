@@ -173,6 +173,19 @@ async def init_db():
         await conn.execute("ALTER TABLE user_logs ADD COLUMN IF NOT EXISTS queue_id INT;")
 
 
+# ==================== FSM STATES (DEFINED EARLY TO PREVENT NAMEERROR) ====================
+
+class AdminStates(StatesGroup):
+    waiting_for_queue_name = State()
+    waiting_for_destination_manual = State()
+    waiting_for_master_log_manual = State()
+    waiting_for_fixed_delay = State()
+    waiting_for_random_delay = State()
+    waiting_for_join_delay = State()
+    waiting_for_uploader_id = State()
+    waiting_for_uploader_name = State()
+
+
 # ==================== HELPER FUNCTIONS ====================
 
 def get_message_content_hash(message: Message) -> str:
@@ -853,7 +866,7 @@ async def admin_global_process_stats(callback: CallbackQuery):
 
     report = ["📊 <b>GLOBAL PROCESS & PERFORMANCE DASHBOARD</b>\n"]
 
-    # 1. Active Broadcast Queues with ETA[cite: 2]
+    # 1. Active Broadcast Queues with ETA
     report.append("🚀 <b>Active Broadcast Queues:</b>")
     active_broadcast_count = 0
 
@@ -864,16 +877,16 @@ async def admin_global_process_stats(callback: CallbackQuery):
             eta_str = format_eta(info["eta_seconds"])
             report.append(
                 f"• <b>{info['name']}</b>\n"
-                f"  ├ Already Sent: <code>{info['sent']} / {info['total']}</code> posts[cite: 2]\n"
-                f"  ├ Destinations: <code>{info['destination']}</code>[cite: 2]\n"
+                f"  ├ Already Sent: <code>{info['sent']} / {info['total']}</code> posts\n"
+                f"  ├ Destinations: <code>{info['destination']}</code>\n"
                 f"  ├ Order: <code>{info['mode'].upper()}</code>\n"
-                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>[cite: 2]\n"
+                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>\n"
             )
 
     if active_broadcast_count == 0:
         report.append("<i>No broadcast queues are currently running.</i>\n")
 
-    # 2. Join Request Processing & Unmatured Channels[cite: 2]
+    # 2. Join Request Processing & Unmatured Channels
     report.append("🤝 <b>Join Request & Unmatured Channels:</b>")
     dest_join_count = 0
 
@@ -900,15 +913,15 @@ async def admin_global_process_stats(callback: CallbackQuery):
             report.append(
                 f"• <b>{title}</b> ({type_label})\n"
                 f"  ├ Status: {accept_tag}\n"
-                f"  ├ Requests: Done <code>{accepted}</code> out of <code>{total_requests}</code> (Pending: <code>{pending}</code>)[cite: 2]\n"
+                f"  ├ Requests: Done <code>{accepted}</code> out of <code>{total_requests}</code> (Pending: <code>{pending}</code>)\n"
                 f"  ├ Delay: <code>{min_d}s - {max_d}s</code>\n"
-                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>[cite: 2]\n"
+                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>\n"
             )
 
     if dest_join_count == 0:
         report.append("<i>No active join request pipelines configured.</i>\n")
 
-    # 3. Queue-Wise Inventory & Lifetime Stats[cite: 2]
+    # 3. Queue-Wise Inventory & Lifetime Stats
     report.append("📁 <b>Queue Inventory & Performance:</b>")
     if all_queues:
         for q in all_queues:
@@ -918,13 +931,13 @@ async def admin_global_process_stats(callback: CallbackQuery):
             runs = q["run_count"] or 0
             report.append(
                 f"• <b>{qname}</b> (ID: <code>{qid}</code>)\n"
-                f"  ├ Saved Posts in DB: <code>{curr_posts}</code>[cite: 2]\n"
-                f"  └ Lifetime Execution: <code>{runs}</code> time(s) run[cite: 2]\n"
+                f"  ├ Saved Posts in DB: <code>{curr_posts}</code>\n"
+                f"  └ Lifetime Execution: <code>{runs}</code> time(s) run\n"
             )
     else:
         report.append("<i>No queues created yet.</i>\n")
 
-    # 4. Destination Health & Activity[cite: 2]
+    # 4. Destination Health & Activity
     report.append("📡 <b>Destination Health & Delivery:</b>")
     if destinations:
         for d in destinations:
@@ -941,7 +954,7 @@ async def admin_global_process_stats(callback: CallbackQuery):
                 roles.append("Broadcast")
 
             role_tag = ", ".join(roles)
-            report.append(f"• <b>{title}</b> [{role_tag}]: <code>{delivered}</code> posts posted")[cite: 2]
+            report.append(f"• <b>{title}</b> [{role_tag}]: <code>{delivered}</code> posts posted")
     else:
         report.append("<i>No destinations connected.</i>")
 
@@ -1080,7 +1093,6 @@ async def admin_toggle_run_hub(callback: CallbackQuery, bot: Bot):
     if queue_id in active_tasks and not active_tasks[queue_id].done():
         active_tasks[queue_id].cancel()
         del active_tasks[queue_id]
-        live_broadcast_stats.pop(queue_id, None)
         await callback.answer("Broadcast stopped.", show_alert=True)
     else:
         pool = await get_pool()
