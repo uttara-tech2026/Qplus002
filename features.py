@@ -61,7 +61,6 @@ active_tasks: dict[int, asyncio.Task] = {}
 active_join_tasks: dict[str, asyncio.Task] = {}
 
 # Live broadcast progress tracking for stats:
-# queue_id -> {"name": str, "sent": int, "total": int, "eta_seconds": float, "destination": str, "mode": str, "delay_type": str}
 live_broadcast_stats: dict[int, dict] = {}
 
 
@@ -608,6 +607,70 @@ async def get_admin_main_kb() -> InlineKeyboardMarkup:
     )
 
 
+# ==================== COMMAND: /addest (SET DESTINATION BY COMMAND) ====================
+
+@router.message(Command("addest"))
+async def cmd_addest(message: Message):
+    """Allows admin to set/add broadcast destination via command: /addest <Nickname> <numerical_id>"""
+    if message.from_user.id != get_admin_id():
+        return
+
+    args = message.text.strip().split()
+    if len(args) != 3:
+        await message.answer(
+            "⚠️ <b>Invalid Command Format!</b>\n\n"
+            "<b>Usage:</b>\n"
+            "<code>/addest GroupNickName numerical_id</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/addest VIP_Channel -1001234567890</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    nickname = args[1].strip()
+    numerical_id = args[2].strip()
+
+    # Validate numeric chat ID (can be negative like -100...)
+    clean_id = numerical_id.lstrip("-")
+    if not clean_id.isdigit():
+        await message.answer("⚠️ <b>Invalid Chat ID!</b> Numerical ID must be numbers only (e.g., <code>-1001234567890</code>).", parse_mode="HTML")
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Register or update destination record
+        await conn.execute(
+            """
+            INSERT INTO destinations (chat_id, title, chat_type, is_unmatured)
+            VALUES ($1, $2, 'channel', FALSE)
+            ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
+            """,
+            numerical_id, nickname
+        )
+        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
+
+    if not queues:
+        await message.answer(
+            f"✅ Destination <b>{nickname}</b> (<code>{numerical_id}</code>) registered!\n\n"
+            "⚠️ Please create a queue to bind this destination as broadcast target.",
+            parse_mode="HTML"
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 Bind as Target for: {q['name']}", callback_data=f"confirm_broadcast_bind:{numerical_id}:{q['id']}")]
+        for q in queues
+    ]
+    buttons.append([InlineKeyboardButton(text="⚙️ Open Destination Actions", callback_data=f"dest_actions:{numerical_id}")])
+
+    await message.answer(
+        f"🎯 <b>Destination Added:</b> <b>{nickname}</b> (<code>{numerical_id}</code>)\n\n"
+        "Select which broadcast queue should deliver to this destination:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
 # ==================== BROADCAST WORKER ====================
 
 async def broadcast_worker(bot: Bot, queue_id: int):
@@ -619,7 +682,6 @@ async def broadcast_worker(bot: Bot, queue_id: int):
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Increment run count
             await conn.execute("UPDATE queues SET run_count = run_count + 1 WHERE id = $1", queue_id)
             q = await conn.fetchrow(
                 "SELECT name, destination, delay_sec, delay_min, delay_max, delay_type, mode FROM queues WHERE id = $1",
@@ -704,7 +766,6 @@ async def broadcast_worker(bot: Bot, queue_id: int):
                         from_chat_id=post["from_chat_id"],
                         message_id=post["message_id"]
                     )
-                    # Increment destination health delivery counter
                     async with pool.acquire() as conn:
                         await conn.execute("UPDATE destinations SET posts_delivered = posts_delivered + 1 WHERE chat_id = $1", cid)
                 except Exception:
@@ -772,7 +833,6 @@ async def broadcast_worker(bot: Bot, queue_id: int):
 
 @router.callback_query(F.data == "admin_global_process_stats")
 async def admin_global_process_stats(callback: CallbackQuery):
-    """Provides a complete real-time dashboard of queues, ETA, join-requests, and destination health."""
     if callback.from_user.id != get_admin_id():
         return
 
@@ -861,7 +921,7 @@ async def admin_global_process_stats(callback: CallbackQuery):
     else:
         report.append("<i>No queues created yet.</i>\n")
 
-    # 4. Destination Health (Posts Delivered to Each Destination)
+    # 4. Destination Health
     report.append("📡 <b>Destination Health & Activity:</b>")
     if destinations:
         for d in destinations:
@@ -1098,7 +1158,7 @@ async def admin_set_fixed_save(message: Message, state: FSMContext):
 
     await state.clear()
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]
+        inline_keyboard=[[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]]
     )
     await message.answer(f"✅ Fixed delay updated to <code>{delay}</code> seconds.", parse_mode="HTML", reply_markup=kb)
 
@@ -1144,7 +1204,7 @@ async def admin_set_random_save(message: Message, state: FSMContext):
 
     await state.clear()
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]
+        inline_keyboard=[[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]]
     )
     await message.answer(f"✅ Random delay range set to <code>{min_d}s - {max_d}s</code>.", parse_mode="HTML", reply_markup=kb)
 
@@ -1163,18 +1223,12 @@ async def admin_view_destinations(callback: CallbackQuery):
         master_log = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
 
     total_count = len(destinations)
-    if total_count == 0:
-        text = (
-            "📡 <b>Connected Destinations: 0</b>\n\n"
-            "The bot is currently not an admin in any channel or group.\n\n"
-            "💡 Add this bot to any channel or group as an Administrator to auto-detect it."
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]])
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        return
-
     buttons = []
-    text = f"📡 <b>Connected Destinations ({total_count} Active):</b>\n\n"
+    text = (
+        f"📡 <b>Connected Destinations ({total_count} Active):</b>\n\n"
+        "💡 <b>Quick Add:</b> Send <code>/addest NickName numerical_id</code> to register a channel/group immediately.\n\n"
+    )
+
     for d in destinations:
         cid = d["chat_id"]
         title = d["title"]
