@@ -21,6 +21,7 @@ from aiogram.types import (
 from aiogram.filters import (
     CommandStart,
     Command,
+    CommandObject,
     StateFilter,
     ChatMemberUpdatedFilter,
     KICKED,
@@ -269,6 +270,83 @@ async def dispatch_notification(bot: Bot, message_text: str, queue_id: Optional[
         pass
 
 
+# ==================== COMMAND: /addest (TOP PRIORITY) ====================
+
+@router.message(Command("addest"))
+async def cmd_addest(message: Message, command: CommandObject):
+    """Allows admin to set/add broadcast destination directly via /addest <Name> <ID>"""
+    await init_db()
+    if message.from_user.id != get_admin_id():
+        return
+
+    args = command.args
+    if not args:
+        await message.answer(
+            "⚠️ <b>Invalid Command Format!</b>\n\n"
+            "<b>Usage:</b>\n"
+            "<code>/addest GroupNickName numerical_id</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/addest VIP_Channel -1001234567890</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    parts = args.strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "⚠️ <b>Missing Arguments!</b>\n\n"
+            "Please provide both a channel/destination name and its numerical ID.\n"
+            "<b>Example:</b> <code>/addest VIP_Channel -1001234567890</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    nickname = parts[0].strip()
+    numerical_id = parts[1].strip()
+
+    clean_id = numerical_id.lstrip("-")
+    if not clean_id.isdigit():
+        await message.answer("⚠️ <b>Invalid Chat ID!</b> Numerical ID must be numbers only (e.g., <code>-1001234567890</code>).", parse_mode="HTML")
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO destinations (chat_id, title, chat_type, is_unmatured)
+            VALUES ($1, $2, 'channel', FALSE)
+            ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
+            """,
+            numerical_id, nickname
+        )
+        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
+
+    if not queues:
+        await message.answer(
+            f"✅ <b>Destination Registered Successfully!</b>\n\n"
+            f"• <b>Name:</b> {nickname}\n"
+            f"• <b>ID:</b> <code>{numerical_id}</code>\n\n"
+            "⚠️ <i>Please create a queue first so you can bind this destination as a broadcast target.</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 Bind as Target for: {q['name']}", callback_data=f"confirm_broadcast_bind:{numerical_id}:{q['id']}")]
+        for q in queues
+    ]
+    buttons.append([InlineKeyboardButton(text="⚙️ Open Destination Actions", callback_data=f"dest_actions:{numerical_id}")])
+
+    await message.answer(
+        f"✅ <b>Destination Registered Successfully!</b>\n\n"
+        f"• <b>Name:</b> {nickname}\n"
+        f"• <b>ID:</b> <code>{numerical_id}</code>\n\n"
+        "Select which broadcast queue should deliver to this destination:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
 # ==================== CHAT JOIN REQUEST LISTENER & WORKER ====================
 
 @router.chat_join_request()
@@ -509,19 +587,6 @@ class UploadBatchSession:
 upload_batches: dict[int, UploadBatchSession] = {}
 
 
-# ==================== FSM STATES ====================
-
-class AdminStates(StatesGroup):
-    waiting_for_queue_name = State()
-    waiting_for_destination_manual = State()
-    waiting_for_master_log_manual = State()
-    waiting_for_fixed_delay = State()
-    waiting_for_random_delay = State()
-    waiting_for_join_delay = State()
-    waiting_for_uploader_id = State()
-    waiting_for_uploader_name = State()
-
-
 # ==================== AUTO-DISCOVERY OF BOT'S CHANNELS/GROUPS ====================
 
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=ADMINISTRATOR))
@@ -607,68 +672,6 @@ async def get_admin_main_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=master_label, callback_data="admin_set_master_log_screen")],
             [InlineKeyboardButton(text="❌ Close Menu", callback_data="admin_close")]
         ]
-    )
-
-
-# ==================== COMMAND: /addest (SET DESTINATION BY COMMAND) ====================
-
-@router.message(Command("addest"))
-async def cmd_addest(message: Message):
-    """Allows admin to set/add broadcast destination via command: /addest <Nickname> <numerical_id>"""
-    if message.from_user.id != get_admin_id():
-        return
-
-    args = message.text.strip().split()
-    if len(args) != 3:
-        await message.answer(
-            "⚠️ <b>Invalid Command Format!</b>\n\n"
-            "<b>Usage:</b>\n"
-            "<code>/addest GroupNickName numerical_id</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/addest VIP_Channel -1001234567890</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    nickname = args[1].strip()
-    numerical_id = args[2].strip()
-
-    clean_id = numerical_id.lstrip("-")
-    if not clean_id.isdigit():
-        await message.answer("⚠️ <b>Invalid Chat ID!</b> Numerical ID must be numbers only (e.g., <code>-1001234567890</code>).", parse_mode="HTML")
-        return
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO destinations (chat_id, title, chat_type, is_unmatured)
-            VALUES ($1, $2, 'channel', FALSE)
-            ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
-            """,
-            numerical_id, nickname
-        )
-        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
-
-    if not queues:
-        await message.answer(
-            f"✅ Destination <b>{nickname}</b> (<code>{numerical_id}</code>) registered successfully!\n\n"
-            "⚠️ Please create a queue to bind this destination as a broadcast target.",
-            parse_mode="HTML"
-        )
-        return
-
-    buttons = [
-        [InlineKeyboardButton(text=f"📁 Bind as Target for: {q['name']}", callback_data=f"confirm_broadcast_bind:{numerical_id}:{q['id']}")]
-        for q in queues
-    ]
-    buttons.append([InlineKeyboardButton(text="⚙️ Open Destination Actions", callback_data=f"dest_actions:{numerical_id}")])
-
-    await message.answer(
-        f"🎯 <b>Destination Added:</b> <b>{nickname}</b> (<code>{numerical_id}</code>)\n\n"
-        "Select which broadcast queue should deliver to this destination:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
 
 
@@ -1117,7 +1120,7 @@ async def admin_open_delay_menu(callback: CallbackQuery):
     ]
     await callback.message.edit_text(
         "⏱ <b>Select Delay Configuration:</b>\n\n"
-        "• <b>Fixed Delay:</b> Constant interval between posts.\n"
+        "• <b>Fixed Delay:</b> Constant interval between every post.\n"
         "• <b>Random Delay Range:</b> Picks a random interval between minimum and maximum seconds.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1132,7 +1135,7 @@ async def admin_set_fixed_prompt(callback: CallbackQuery, state: FSMContext):
     await state.update_data(current_queue_id=queue_id)
     await state.set_state(AdminStates.waiting_for_fixed_delay)
     await callback.message.edit_text(
-        "⏱ <b>Set Fixed Delay:</b>\n\nSend delay in seconds (e.g. <code>15</code>):",
+        "⏱ <b>Set Fixed Delay:</b>\n\nSend the delay between posts in seconds (e.g. <code>15</code>):",
         parse_mode="HTML"
     )
 
@@ -1190,7 +1193,7 @@ async def admin_set_random_save(message: Message, state: FSMContext):
     min_d = int(raw[0])
     max_d = int(raw[1])
     if min_d < 1 or max_d < min_d:
-        await message.answer("⚠️ Minimum must be at least 1 and Maximum must be >= Minimum.")
+        await message.answer("⚠️ Minimum must be >= 1 and Maximum must be >= Minimum.")
         return
 
     data = await state.get_data()
