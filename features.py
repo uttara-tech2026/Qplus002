@@ -33,7 +33,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
 
-# Force-load environment variables immediately
 load_dotenv()
 
 router = Router()
@@ -122,7 +121,8 @@ async def init_db():
                 join_delay_min INT DEFAULT 3,
                 join_delay_max INT DEFAULT 10,
                 assigned_queue_id INT REFERENCES queues(id) ON DELETE SET NULL,
-                posts_delivered INT DEFAULT 0
+                posts_delivered INT DEFAULT 0,
+                total_accepted INT DEFAULT 0
             );
         """)
         await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS is_unmatured BOOLEAN DEFAULT FALSE;")
@@ -131,6 +131,7 @@ async def init_db():
         await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS join_delay_max INT DEFAULT 10;")
         await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS assigned_queue_id INT REFERENCES queues(id) ON DELETE SET NULL;")
         await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS posts_delivered INT DEFAULT 0;")
+        await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS total_accepted INT DEFAULT 0;")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS join_requests (
@@ -162,13 +163,13 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS user_logs (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
+                queue_id INT,
                 is_duplicate BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        await conn.execute("""
-            ALTER TABLE user_logs ADD COLUMN IF NOT EXISTS is_duplicate BOOLEAN DEFAULT FALSE;
-        """)
+        await conn.execute("ALTER TABLE user_logs ADD COLUMN IF NOT EXISTS is_duplicate BOOLEAN DEFAULT FALSE;")
+        await conn.execute("ALTER TABLE user_logs ADD COLUMN IF NOT EXISTS queue_id INT;")
 
 
 # ==================== HELPER FUNCTIONS ====================
@@ -331,6 +332,8 @@ async def join_request_worker(bot: Bot, chat_id: str):
             try:
                 await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
                 accepted_count += 1
+                async with pool.acquire() as conn:
+                    await conn.execute("UPDATE destinations SET total_accepted = total_accepted + 1 WHERE chat_id = $1", chat_id)
             except Exception:
                 pass
 
@@ -414,13 +417,13 @@ class UploadBatchSession:
                     [(self.queue_id, self.user_id, fc, mi, ch) for fc, mi, ch in to_insert]
                 )
                 await conn.executemany(
-                    "INSERT INTO user_logs (user_id, is_duplicate) VALUES ($1, FALSE)",
-                    [(self.user_id,) for _ in to_insert]
+                    "INSERT INTO user_logs (user_id, queue_id, is_duplicate) VALUES ($1, $2, FALSE)",
+                    [(self.user_id, self.queue_id) for _ in to_insert]
                 )
             if dup_logs > 0:
                 await conn.executemany(
-                    "INSERT INTO user_logs (user_id, is_duplicate) VALUES ($1, TRUE)",
-                    [(self.user_id,) for _ in range(dup_logs)]
+                    "INSERT INTO user_logs (user_id, queue_id, is_duplicate) VALUES ($1, $2, TRUE)",
+                    [(self.user_id, self.queue_id) for _ in range(dup_logs)]
                 )
 
     async def _update_ui(self, is_final: bool = False):
@@ -630,7 +633,6 @@ async def cmd_addest(message: Message):
     nickname = args[1].strip()
     numerical_id = args[2].strip()
 
-    # Validate numeric chat ID (can be negative like -100...)
     clean_id = numerical_id.lstrip("-")
     if not clean_id.isdigit():
         await message.answer("⚠️ <b>Invalid Chat ID!</b> Numerical ID must be numbers only (e.g., <code>-1001234567890</code>).", parse_mode="HTML")
@@ -638,7 +640,6 @@ async def cmd_addest(message: Message):
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Register or update destination record
         await conn.execute(
             """
             INSERT INTO destinations (chat_id, title, chat_type, is_unmatured)
@@ -651,8 +652,8 @@ async def cmd_addest(message: Message):
 
     if not queues:
         await message.answer(
-            f"✅ Destination <b>{nickname}</b> (<code>{numerical_id}</code>) registered!\n\n"
-            "⚠️ Please create a queue to bind this destination as broadcast target.",
+            f"✅ Destination <b>{nickname}</b> (<code>{numerical_id}</code>) registered successfully!\n\n"
+            "⚠️ Please create a queue to bind this destination as a broadcast target.",
             parse_mode="HTML"
         )
         return
@@ -829,7 +830,7 @@ async def broadcast_worker(bot: Bot, queue_id: int):
         live_broadcast_stats.pop(queue_id, None)
 
 
-# ==================== GLOBAL PROCESS STATS MONITOR ====================
+# ==================== GLOBAL PROCESS STATS DASHBOARD ====================
 
 @router.callback_query(F.data == "admin_global_process_stats")
 async def admin_global_process_stats(callback: CallbackQuery):
@@ -839,20 +840,18 @@ async def admin_global_process_stats(callback: CallbackQuery):
     pool = await get_pool()
     async with pool.acquire() as conn:
         all_queues = await conn.fetch("SELECT id, name, destination, delay_sec, mode, run_count FROM queues ORDER BY id ASC")
-        destinations = await conn.fetch("SELECT chat_id, title, is_unmatured, accept_requests, join_delay_min, join_delay_max, posts_delivered, assigned_queue_id FROM destinations ORDER BY title ASC")
+        destinations = await conn.fetch("SELECT chat_id, title, is_unmatured, accept_requests, join_delay_min, join_delay_max, posts_delivered, total_accepted FROM destinations ORDER BY title ASC")
         queue_post_counts = await conn.fetch("SELECT queue_id, COUNT(*) as count FROM posts GROUP BY queue_id")
         join_pending_counts = await conn.fetch("SELECT chat_id, COUNT(*) as count FROM join_requests WHERE status = 'pending' GROUP BY chat_id")
-        join_total_counts = await conn.fetch("SELECT chat_id, COUNT(*) as count FROM join_requests GROUP BY chat_id")
         master_log_id = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
 
     posts_map = {row["queue_id"]: row["count"] for row in queue_post_counts}
     join_pending_map = {row["chat_id"]: row["count"] for row in join_pending_counts}
-    join_total_map = {row["chat_id"]: row["count"] for row in join_total_counts}
 
     report = ["📊 <b>GLOBAL PROCESS & PERFORMANCE DASHBOARD</b>\n"]
 
-    # 1. Active Broadcast Queues with ETA
-    report.append("🚀 <b>Active Running Queues:</b>")
+    # 1. Active Broadcast Queues with ETA[cite: 2]
+    report.append("🚀 <b>Active Broadcast Queues:</b>")
     active_broadcast_count = 0
 
     for qid, task in list(active_tasks.items()):
@@ -862,16 +861,16 @@ async def admin_global_process_stats(callback: CallbackQuery):
             eta_str = format_eta(info["eta_seconds"])
             report.append(
                 f"• <b>{info['name']}</b>\n"
-                f"  ├ Progress: <code>{info['sent']} / {info['total']}</code> posts\n"
-                f"  ├ Destinations: <code>{info['destination']}</code>\n"
+                f"  ├ Already Sent: <code>{info['sent']} / {info['total']}</code> posts[cite: 2]\n"
+                f"  ├ Destinations: <code>{info['destination']}</code>[cite: 2]\n"
                 f"  ├ Order: <code>{info['mode'].upper()}</code>\n"
-                f"  └ ⏳ <b>ETA to Complete:</b> <code>{eta_str}</code>\n"
+                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>[cite: 2]\n"
             )
 
     if active_broadcast_count == 0:
         report.append("<i>No broadcast queues are currently running.</i>\n")
 
-    # 2. Join Request Processing & Unmatured Channels
+    # 2. Join Request Processing & Unmatured Channels[cite: 2]
     report.append("🤝 <b>Join Request & Unmatured Channels:</b>")
     dest_join_count = 0
 
@@ -881,14 +880,15 @@ async def admin_global_process_stats(callback: CallbackQuery):
         is_unmatured = d["is_unmatured"]
         accepting = d["accept_requests"]
         pending = join_pending_map.get(cid, 0)
-        total = join_total_map.get(cid, 0)
-        accepted = total - pending
+        accepted = d["total_accepted"] or 0
+        total_requests = accepted + pending
+
         min_d = d["join_delay_min"] or 3
         max_d = d["join_delay_max"] or 10
 
-        if is_unmatured or accepting or total > 0:
+        if is_unmatured or accepting or total_requests > 0:
             dest_join_count += 1
-            accept_tag = "🟢 Accepting Joins" if accepting else "⚪ Paused"
+            accept_tag = "🟢 Accepting" if accepting else "⚪ Paused"
             avg_delay = (min_d + max_d) / 2
             eta_val = pending * avg_delay if accepting else 0
             eta_str = format_eta(eta_val) if accepting and pending > 0 else "Paused / None"
@@ -896,16 +896,16 @@ async def admin_global_process_stats(callback: CallbackQuery):
             type_label = "Unmatured" if is_unmatured else "Broadcast"
             report.append(
                 f"• <b>{title}</b> ({type_label})\n"
-                f"  ├ Acceptance: {accept_tag}\n"
-                f"  ├ Requests: <code>{accepted} / {total}</code> done (<b>{pending} pending</b>)\n"
+                f"  ├ Status: {accept_tag}\n"
+                f"  ├ Requests: Done <code>{accepted}</code> out of <code>{total_requests}</code> (Pending: <code>{pending}</code>)[cite: 2]\n"
                 f"  ├ Delay: <code>{min_d}s - {max_d}s</code>\n"
-                f"  └ ⏳ <b>ETA to Complete:</b> <code>{eta_str}</code>\n"
+                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>[cite: 2]\n"
             )
 
     if dest_join_count == 0:
         report.append("<i>No active join request pipelines configured.</i>\n")
 
-    # 3. Queue-Wise Inventory & Lifetime Stats
+    # 3. Queue-Wise Inventory & Lifetime Stats[cite: 2]
     report.append("📁 <b>Queue Inventory & Performance:</b>")
     if all_queues:
         for q in all_queues:
@@ -915,14 +915,14 @@ async def admin_global_process_stats(callback: CallbackQuery):
             runs = q["run_count"] or 0
             report.append(
                 f"• <b>{qname}</b> (ID: <code>{qid}</code>)\n"
-                f"  ├ Saved Posts in DB: <code>{curr_posts}</code>\n"
-                f"  └ Lifetime Execution: <code>{runs}</code> time(s) launched\n"
+                f"  ├ Saved Posts in DB: <code>{curr_posts}</code>[cite: 2]\n"
+                f"  └ Lifetime Execution: <code>{runs}</code> time(s) run[cite: 2]\n"
             )
     else:
         report.append("<i>No queues created yet.</i>\n")
 
-    # 4. Destination Health
-    report.append("📡 <b>Destination Health & Activity:</b>")
+    # 4. Destination Health & Activity[cite: 2]
+    report.append("📡 <b>Destination Health & Delivery:</b>")
     if destinations:
         for d in destinations:
             cid = d["chat_id"]
@@ -938,13 +938,13 @@ async def admin_global_process_stats(callback: CallbackQuery):
                 roles.append("Broadcast")
 
             role_tag = ", ".join(roles)
-            report.append(f"• <b>{title}</b> [{role_tag}]: <code>{delivered}</code> posts delivered")
+            report.append(f"• <b>{title}</b> [{role_tag}]: <code>{delivered}</code> posts posted")[cite: 2]
     else:
         report.append("<i>No destinations connected.</i>")
 
     buttons = [
         [InlineKeyboardButton(text="🔄 Refresh Live Stats", callback_data="admin_global_process_stats")],
-        [InlineKeyboardButton(text="🚀 Go to Running Hub", callback_data="admin_running_queues")],
+        [InlineKeyboardButton(text="🚀 Running Queues Hub", callback_data="admin_running_queues")],
         [InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
     ]
 
@@ -1021,7 +1021,7 @@ async def admin_running_queues(callback: CallbackQuery):
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        queues = await conn.fetch("SELECT id, name, destination, mode, delay_type, delay_sec, delay_min, delay_max FROM queues ORDER BY id ASC")
+        queues = await conn.fetch("SELECT id, name, run_count FROM queues ORDER BY id ASC")
 
     if not queues:
         await callback.message.edit_text(
@@ -1039,7 +1039,7 @@ async def admin_running_queues(callback: CallbackQuery):
         qname = q["name"]
         is_running = qid in active_tasks and not active_tasks[qid].done()
         status_symbol = "🟢 Running" if is_running else "⚪ Idle"
-        text_lines.append(f"• <b>{qname}</b> — {status_symbol}")
+        text_lines.append(f"• <b>{qname}</b> — {status_symbol} (Runs: {q['run_count']})")
         buttons.append([InlineKeyboardButton(text=f"⚙️ Schedule/Control: {qname} ({status_symbol})", callback_data=f"run_hub_q:{qid}")])
 
     buttons.append([InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")])
@@ -1077,6 +1077,7 @@ async def admin_toggle_run_hub(callback: CallbackQuery, bot: Bot):
     if queue_id in active_tasks and not active_tasks[queue_id].done():
         active_tasks[queue_id].cancel()
         del active_tasks[queue_id]
+        live_broadcast_stats.pop(queue_id, None)
         await callback.answer("Broadcast stopped.", show_alert=True)
     else:
         pool = await get_pool()
@@ -1116,7 +1117,7 @@ async def admin_open_delay_menu(callback: CallbackQuery):
     ]
     await callback.message.edit_text(
         "⏱ <b>Select Delay Configuration:</b>\n\n"
-        "• <b>Fixed Delay:</b> Constant interval between every post.\n"
+        "• <b>Fixed Delay:</b> Constant interval between posts.\n"
         "• <b>Random Delay Range:</b> Picks a random interval between minimum and maximum seconds.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1131,7 +1132,7 @@ async def admin_set_fixed_prompt(callback: CallbackQuery, state: FSMContext):
     await state.update_data(current_queue_id=queue_id)
     await state.set_state(AdminStates.waiting_for_fixed_delay)
     await callback.message.edit_text(
-        "⏱ <b>Set Fixed Delay:</b>\n\nSend the delay between posts in seconds (e.g. <code>15</code>):",
+        "⏱ <b>Set Fixed Delay:</b>\n\nSend delay in seconds (e.g. <code>15</code>):",
         parse_mode="HTML"
     )
 
@@ -1158,7 +1159,7 @@ async def admin_set_fixed_save(message: Message, state: FSMContext):
 
     await state.clear()
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]]
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]
     )
     await message.answer(f"✅ Fixed delay updated to <code>{delay}</code> seconds.", parse_mode="HTML", reply_markup=kb)
 
@@ -1204,7 +1205,7 @@ async def admin_set_random_save(message: Message, state: FSMContext):
 
     await state.clear()
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]]
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]
     )
     await message.answer(f"✅ Random delay range set to <code>{min_d}s - {max_d}s</code>.", parse_mode="HTML", reply_markup=kb)
 
@@ -1281,6 +1282,7 @@ async def render_dest_actions(callback: CallbackQuery, chat_id: str):
     accept_requests = dest["accept_requests"]
     join_min = dest["join_delay_min"] or 3
     join_max = dest["join_delay_max"] or 10
+    total_acc = dest["total_accepted"] or 0
     delivered = dest["posts_delivered"] or 0
 
     buttons = [
